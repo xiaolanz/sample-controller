@@ -427,6 +427,10 @@
 			"Rev": "150d32b09b5966b39cb02d7945f0d1bc7b9f1a19"
 		},
 		{
+			"ImportPath": "k8s.io/kubernetes/pkg/controller/history",
+			"Rev": "aba725a391d5c885354535d3cd5c01ae92d53ce1"
+		},
+		{
 			"ImportPath": "k8s.io/client-go/discovery",
 			"Rev": "9f7db9794b9bd0183e59f73486b930e3733ff4c0"
 		},
