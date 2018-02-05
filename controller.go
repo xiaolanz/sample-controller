@@ -17,8 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"time"
+	"encoding/json"
 
 	"github.com/golang/glog"
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,7 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/runtime"
+	uruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -36,6 +40,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/kubernetes/pkg/controller/history"
+	"k8s.io/apimachinery/pkg/runtime"
+	labelsutil "k8s.io/kubernetes/pkg/util/labels"
+	hashutil "k8s.io/kubernetes/pkg/util/hash"
+	"k8s.io/apimachinery/pkg/util/rand"
+
 
 	samplev1alpha1 "k8s.io/sample-controller/pkg/apis/samplecontroller/v1alpha1"
 	clientset "k8s.io/sample-controller/pkg/client/clientset/versioned"
@@ -59,7 +69,15 @@ const (
 	// MessageResourceSynced is the message used for an Event fired when a Foo
 	// is synced successfully
 	MessageResourceSynced = "Foo synced successfully"
+
+	historyLimit = 5
 )
+
+var controllerKind = schema.GroupVersionKind{
+					Group:   samplev1alpha1.SchemeGroupVersion.Group,
+					Version: samplev1alpha1.SchemeGroupVersion.Version,
+					Kind:    "Foo",
+				}
 
 // Controller is the controller implementation for Foo resources
 type Controller struct {
@@ -72,6 +90,8 @@ type Controller struct {
 	deploymentsSynced cache.InformerSynced
 	foosLister        listers.FooLister
 	foosSynced        cache.InformerSynced
+
+	controllerHistory history.Interface
 
 	// workqueue is a rate limited work queue. This is used to queue work to be
 	// processed instead of performing it as soon as a change happens. This
@@ -125,27 +145,6 @@ func NewController(
 			controller.enqueueFoo(new)
 		},
 	})
-	// Set up an event handler for when Deployment resources change. This
-	// handler will lookup the owner of the given Deployment, and if it is
-	// owned by a Foo resource will enqueue that Foo resource for
-	// processing. This way, we don't need to implement custom logic for
-	// handling Deployment resources. More info on this pattern:
-	// https://github.com/kubernetes/community/blob/8cafef897a22026d42f5e5bb3f104febe7e29830/contributors/devel/controllers.md
-	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handleObject,
-		UpdateFunc: func(old, new interface{}) {
-			newDepl := new.(*appsv1.Deployment)
-			oldDepl := old.(*appsv1.Deployment)
-			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
-				// Periodic resync will send update events for all known Deployments.
-				// Two different versions of the same Deployment will always have different RVs.
-				return
-			}
-			controller.handleObject(new)
-		},
-		DeleteFunc: controller.handleObject,
-	})
-
 	return controller
 }
 
@@ -154,7 +153,7 @@ func NewController(
 // is closed, at which point it will shutdown the workqueue and wait for
 // workers to finish processing their current work items.
 func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
-	defer runtime.HandleCrash()
+	defer uruntime.HandleCrash()
 	defer c.workqueue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
@@ -217,7 +216,7 @@ func (c *Controller) processNextWorkItem() bool {
 			// Forget here else we'd go into a loop of attempting to
 			// process a work item that is invalid.
 			c.workqueue.Forget(obj)
-			runtime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
+			uruntime.HandleError(fmt.Errorf("expected string in workqueue but got %#v", obj))
 			return nil
 		}
 		// Run the syncHandler, passing it the namespace/name string of the
@@ -233,7 +232,7 @@ func (c *Controller) processNextWorkItem() bool {
 	}(obj)
 
 	if err != nil {
-		runtime.HandleError(err)
+		uruntime.HandleError(err)
 		return true
 	}
 
@@ -247,7 +246,7 @@ func (c *Controller) syncHandler(key string) error {
 	// Convert the namespace/name string into a distinct namespace and name
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+		uruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
 		return nil
 	}
 
@@ -257,82 +256,76 @@ func (c *Controller) syncHandler(key string) error {
 		// The Foo resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			runtime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			uruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
 			return nil
 		}
 
 		return err
 	}
 
-	deploymentName := foo.Spec.DeploymentName
-	if deploymentName == "" {
-		// We choose to absorb the error here as the worker would requeue the
-		// resource otherwise. Instead, the next time the resource is updated
-		// the resource will be queued again.
-		runtime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
-		return nil
+		// list all revisions and sort them
+	revisions, err := c.ListRevisions(foo)
+	if err != nil {
+		return err
 	}
+	history.SortControllerRevisions(revisions)
 
-	// Get the deployment with the name specified in Foo.spec
-	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
-	// If the resource doesn't exist, we'll create it
-	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(newDeployment(foo))
-	}
-
-	// If an error occurs during Get/Create, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
+	// get the current, and update revisions
+	currentRevision, updateRevision, collisionCount, err := c.getRevisions(foo, revisions)
 	if err != nil {
 		return err
 	}
 
-	// If the Deployment is not controlled by this Foo resource, we should log
-	// a warning to the event recorder and ret
-	if !metav1.IsControlledBy(deployment, foo) {
-		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
-		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return fmt.Errorf(msg)
-	}
+	// set the generation, and revisions in the returned status
+	status := new(samplev1alpha1.FooStatus)
+	status.ObservedGeneration = foo.Generation
+	status.CurrentRevision = currentRevision.Name
+	status.UpdateRevision = updateRevision.Name
+	status.CollisionCount = &collisionCount
 
-	// If this number of the replicas on the Foo resource is specified, and the
-	// number does not equal the current desired replicas on the Deployment, we
-	// should update the Deployment resource.
-	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		glog.V(4).Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(newDeployment(foo))
-	}
-
-	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. THis could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
-
-	// Finally, we update the status block of the Foo resource to reflect the
-	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
+	// update the set's status
+	err = c.updateFooStatus(foo, status)
 	if err != nil {
 		return err
 	}
 
 	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
-	return nil
+	// maintain the set's revision history limit
+	return c.truncateHistory(foo, revisions, currentRevision, updateRevision)
 }
 
-func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
+func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, status *samplev1alpha1.FooStatus) error {
+		// complete any in progress rolling update if necessary
+	completeRollingUpdate(foo, status)
+
+	// if the status is not inconsistent do not perform an update
+	if !inconsistentStatus(foo, status) {
+		return nil
+	}
+
 	// NEVER modify objects from the store. It's a read-only, local cache.
 	// You can use DeepCopy() to make a deep copy of original object and modify this copy
 	// Or create a copy manually for better performance
 	fooCopy := foo.DeepCopy()
-	fooCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
+	fooCopy.Status.CollisionCount = status.CollisionCount
+	fooCopy.Status.CurrentRevision = status.CurrentRevision
+	fooCopy.Status.ObservedGeneration = status.ObservedGeneration
+	fooCopy.Status.UpdateRevision = status.UpdateRevision
+
 	// Until #38113 is merged, we must use Update instead of UpdateStatus to
 	// update the Status block of the Foo resource. UpdateStatus will not
 	// allow changes to the Spec of the resource, which is ideal for ensuring
 	// nothing other than resource status has been updated.
 	_, err := c.sampleclientset.SamplecontrollerV1alpha1().Foos(foo.Namespace).Update(fooCopy)
 	return err
+}
+
+// inconsistentStatus returns true if the ObservedGeneration of status is greater than set's
+// Generation or if any of the status's fields do not match those of set's status.
+func inconsistentStatus(foo *samplev1alpha1.Foo, status *samplev1alpha1.FooStatus) bool {
+	return status.ObservedGeneration > foo.Status.ObservedGeneration ||
+		status.CurrentRevision != foo.Status.CurrentRevision ||
+		status.UpdateRevision != foo.Status.UpdateRevision
 }
 
 // enqueueFoo takes a Foo resource and converts it into a namespace/name
@@ -342,90 +335,204 @@ func (c *Controller) enqueueFoo(obj interface{}) {
 	var key string
 	var err error
 	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
-		runtime.HandleError(err)
+		uruntime.HandleError(err)
 		return
 	}
 	c.workqueue.AddRateLimited(key)
 }
 
-// handleObject will take any resource implementing metav1.Object and attempt
-// to find the Foo resource that 'owns' it. It does this by looking at the
-// objects metadata.ownerReferences field for an appropriate OwnerReference.
-// It then enqueues that Foo resource to be processed. If the object does not
-// have an appropriate OwnerReference, it will simply be skipped.
-func (c *Controller) handleObject(obj interface{}) {
-	var object metav1.Object
-	var ok bool
-	if object, ok = obj.(metav1.Object); !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			runtime.HandleError(fmt.Errorf("error decoding object, invalid type"))
-			return
-		}
-		object, ok = tombstone.Obj.(metav1.Object)
-		if !ok {
-			runtime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
-			return
-		}
-		glog.V(4).Infof("Recovered deleted object '%s' from tombstone", object.GetName())
-	}
-	glog.V(4).Infof("Processing object: %s", object.GetName())
-	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
-		// If this object is not owned by a Foo, we should not do anything more
-		// with it.
-		if ownerRef.Kind != "Foo" {
-			return
-		}
+func computeHash(foo *samplev1alpha1.Foo, collisionCount *int32) uint32 {
+	hasher := fnv.New32a()
+	hashutil.DeepHashObject(hasher, foo)
 
-		foo, err := c.foosLister.Foos(object.GetNamespace()).Get(ownerRef.Name)
-		if err != nil {
-			glog.V(4).Infof("ignoring orphaned object '%s' of foo '%s'", object.GetSelfLink(), ownerRef.Name)
-			return
-		}
-
-		c.enqueueFoo(foo)
-		return
+	// Add collisionCount in the hash if it exists.
+	if collisionCount != nil {
+		collisionCountBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint32(collisionCountBytes, uint32(*collisionCount))
+		hasher.Write(collisionCountBytes)
 	}
+
+	return hasher.Sum32()
 }
 
-// newDeployment creates a new Deployment for a Foo resource. It also sets
-// the appropriate OwnerReferences on the resource so handleObject can discover
-// the Foo resource that 'owns' it.
-func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
-	labels := map[string]string{
-		"app":        "nginx",
-		"controller": foo.Name,
+// newRevision creates a new ControllerRevision containing a patch that reapplies the target state of set.
+// The Revision of the returned ControllerRevision is set to revision. If the returned error is nil, the returned
+// ControllerRevision is valid.
+func newRevision(foo *samplev1alpha1.Foo, revision int64, collisionCount *int32) (*appsv1.ControllerRevision, error) {
+	patch, err := getPatch(foo)
+	if err != nil {
+		return nil, err
 	}
-	return &appsv1.Deployment{
+	if err != nil {
+		return nil, err
+	}
+
+	hash := fmt.Sprint(computeHash(foo, collisionCount))
+	name := foo.Name + "-" + rand.SafeEncodeString(hash)
+	cr := &appsv1.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      foo.Spec.DeploymentName,
-			Namespace: foo.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(foo, schema.GroupVersionKind{
-					Group:   samplev1alpha1.SchemeGroupVersion.Group,
-					Version: samplev1alpha1.SchemeGroupVersion.Version,
-					Kind:    "Foo",
-				}),
-			},
+			Name:            name,
+			Namespace:       foo.Namespace,
+			Labels:          labelsutil.CloneAndAddLabel(foo.Labels, "fooHash", hash),
+			Annotations:     foo.Annotations,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(foo, controllerKind)},
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: foo.Spec.Replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "nginx",
-							Image: "nginx:latest",
-						},
-					},
-				},
-			},
-		},
+		Data:     runtime.RawExtension{Raw: patch},
+		Revision: revision,
 	}
+	return cr, nil
+}
+
+var patchCodec = scheme.Codecs.LegacyCodec(appsv1.SchemeGroupVersion)
+
+// getPatch returns a strategic merge patch that can be applied to restore Foo to a
+// previous version.
+func getPatch(foo *samplev1alpha1.Foo) ([]byte, error) {
+	str, err := runtime.Encode(patchCodec, foo)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]interface{}
+	json.Unmarshal([]byte(str), &raw)
+	objCopy := make(map[string]interface{})
+	spec := raw["spec"].(map[string]interface{})
+	spec["$patch"] = "replace"
+	objCopy["spec"] = spec
+	patch, err := json.Marshal(objCopy)
+	return patch, err
+}
+
+// ApplyRevision returns a new Foo constructed by restoring the state in revision to set. If the returned error
+// is nil, the returned Foo is valid.
+func ApplyRevision(foo *samplev1alpha1.Foo, revision *appsv1.ControllerRevision) (*samplev1alpha1.Foo, error) {
+	clone := foo.DeepCopy()
+	patched, err := strategicpatch.StrategicMergePatch([]byte(runtime.EncodeOrDie(patchCodec, clone)), revision.Data.Raw, clone)
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(patched, clone)
+	if err != nil {
+		return nil, err
+	}
+	return clone, nil
+}
+
+// nextRevision finds the next valid revision number based on revisions. If the length of revisions
+// is 0 this is 1. Otherwise, it is 1 greater than the largest revision's Revision. This method
+// assumes that revisions has been sorted by Revision.
+func nextRevision(revisions []*appsv1.ControllerRevision) int64 {
+	count := len(revisions)
+	if count <= 0 {
+		return 1
+	}
+	return revisions[count-1].Revision + 1
+}
+
+// completeRollingUpdate completes a rolling update when all of set's replica Pods have been updated
+// to the updateRevision. status's currentRevision is set to updateRevision and its' updateRevision
+// is set to the empty string. status's currentReplicas is set to updateReplicas and its updateReplicas
+// are set to 0.
+func completeRollingUpdate(foo *samplev1alpha1.Foo, status *samplev1alpha1.FooStatus) {
+	status.CurrentRevision = status.UpdateRevision
+}
+
+func (c *Controller) ListRevisions(foo *samplev1alpha1.Foo) ([]*appsv1.ControllerRevision, error) {
+	return c.controllerHistory.ListControllerRevisions(foo, nil)
+}
+
+func (c *Controller) AdoptOrphanRevisions(
+	foo *samplev1alpha1.Foo,
+	revisions []*appsv1.ControllerRevision) error {
+	for i := range revisions {
+		adopted, err := c.controllerHistory.AdoptControllerRevision(foo, controllerKind, revisions[i])
+		if err != nil {
+			return err
+		}
+		revisions[i] = adopted
+	}
+	return nil
+}
+
+// truncateHistory truncates any non-live ControllerRevisions in revisions from set's history.
+func (c *Controller) truncateHistory(
+	foo *samplev1alpha1.Foo,
+	revisions []*appsv1.ControllerRevision,
+	current *appsv1.ControllerRevision,
+	update *appsv1.ControllerRevision) error {
+	history := make([]*appsv1.ControllerRevision, 0, len(revisions))
+	for i := range revisions {
+		history = append(history, revisions[i])
+	}
+	historyLen := len(history)
+	if historyLen <= historyLimit {
+		return nil
+	}
+	// delete any non-live history to maintain the revision limit.
+	history = history[:(historyLen - historyLimit)]
+	for i := 0; i < len(history); i++ {
+		if err := c.controllerHistory.DeleteControllerRevision(history[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) getRevisions(
+	foo *samplev1alpha1.Foo,
+	revisions []*appsv1.ControllerRevision) (*appsv1.ControllerRevision, *appsv1.ControllerRevision, int32, error) {
+	var currentRevision, updateRevision *appsv1.ControllerRevision
+
+	revisionCount := len(revisions)
+	history.SortControllerRevisions(revisions)
+
+	// Use a local copy of set.Status.CollisionCount to avoid modifying set.Status directly.
+	// This copy is returned so the value gets carried over to set.Status in updateStatefulSet.
+	var collisionCount int32
+	if foo.Status.CollisionCount != nil {
+		collisionCount = *foo.Status.CollisionCount
+	}
+
+	// create a new revision from the current set
+	updateRevision, err := newRevision(foo, nextRevision(revisions), &collisionCount)
+	if err != nil {
+		return nil, nil, collisionCount, err
+	}
+
+	// find any equivalent revisions
+	equalRevisions := history.FindEqualRevisions(revisions, updateRevision)
+	equalCount := len(equalRevisions)
+
+	if equalCount > 0 && history.EqualRevision(revisions[revisionCount-1], equalRevisions[equalCount-1]) {
+		// if the equivalent revision is immediately prior the update revision has not changed
+		updateRevision = revisions[revisionCount-1]
+	} else if equalCount > 0 {
+		// if the equivalent revision is not immediately prior we will roll back by incrementing the
+		// Revision of the equivalent revision
+		updateRevision, err = c.controllerHistory.UpdateControllerRevision(
+			equalRevisions[equalCount-1],
+			updateRevision.Revision)
+		if err != nil {
+			return nil, nil, collisionCount, err
+		}
+	} else {
+		//if there is no equivalent revision we create a new one
+		updateRevision, err = c.controllerHistory.CreateControllerRevision(foo, updateRevision, &collisionCount)
+		if err != nil {
+			return nil, nil, collisionCount, err
+		}
+	}
+
+	// attempt to find the revision that corresponds to the current revision
+	for i := range revisions {
+		if revisions[i].Name == foo.Status.CurrentRevision {
+			currentRevision = revisions[i]
+		}
+	}
+
+	// if the current revision is nil we initialize the history by setting it to the update revision
+	if currentRevision == nil {
+		currentRevision = updateRevision
+	}
+
+	return currentRevision, updateRevision, collisionCount, nil
 }

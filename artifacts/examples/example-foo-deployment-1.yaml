@@ -1,0 +1,27 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  labels:
+    app: nginx
+    controller: example-foo
+  name: example-foo
+  namespace: default
+  ownerReferences:
+  - group: samplecontroller.k8s.io
+    version: v1alpha1
+    kind: Foo
+    name: example-foo
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+      controller: example-foo
+  template:
+    metadata:
+      labels:
+        app: nginx
+        controller: example-foo
+    spec:
+      containers:
+      - image: nginx:latest
+        name: nginx
