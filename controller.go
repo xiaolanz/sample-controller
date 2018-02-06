@@ -263,6 +263,7 @@ func (c *Controller) syncHandler(key string) error {
 		return err
 	}
 
+	glog.Info("Foo revisions: %v", foo)
 		// list all revisions and sort them
 	revisions, err := c.ListRevisions(foo)
 	if err != nil {
@@ -282,6 +283,8 @@ func (c *Controller) syncHandler(key string) error {
 	status.CurrentRevision = currentRevision.Name
 	status.UpdateRevision = updateRevision.Name
 	status.CollisionCount = &collisionCount
+
+	glog.Info("Foo status %v", status)
 
 	// update the set's status
 	err = c.updateFooStatus(foo, status)
