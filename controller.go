@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	uruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -36,7 +37,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	appslisters "k8s.io/client-go/listers/apps/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -86,8 +86,6 @@ type Controller struct {
 	// sampleclientset is a clientset for our own API group
 	sampleclientset clientset.Interface
 
-	deploymentsLister appslisters.DeploymentLister
-	deploymentsSynced cache.InformerSynced
 	foosLister        listers.FooLister
 	foosSynced        cache.InformerSynced
 
@@ -113,8 +111,8 @@ func NewController(
 
 	// obtain references to shared index informers for the Deployment and Foo
 	// types.
-	deploymentInformer := kubeInformerFactory.Apps().V1().Deployments()
 	fooInformer := sampleInformerFactory.Samplecontroller().V1alpha1().Foos()
+	revInformer := kubeInformerFactory.Apps().V1().ControllerRevisions()
 
 	// Create event broadcaster
 	// Add sample-controller types to the default Kubernetes Scheme so Events can be
@@ -129,12 +127,11 @@ func NewController(
 	controller := &Controller{
 		kubeclientset:     kubeclientset,
 		sampleclientset:   sampleclientset,
-		deploymentsLister: deploymentInformer.Lister(),
-		deploymentsSynced: deploymentInformer.Informer().HasSynced,
 		foosLister:        fooInformer.Lister(),
 		foosSynced:        fooInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
 		recorder:          recorder,
+		controllerHistory: history.NewHistory(kubeclientset, revInformer.Lister()),
 	}
 
 	glog.Info("Setting up event handlers")
@@ -161,7 +158,7 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 
 	// Wait for the caches to be synced before starting workers
 	glog.Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.foosSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.foosSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -263,13 +260,13 @@ func (c *Controller) syncHandler(key string) error {
 		return err
 	}
 
-	glog.Info("Foo revisions: %v", foo)
-		// list all revisions and sort them
+	// list all revisions and sort them
 	revisions, err := c.ListRevisions(foo)
 	if err != nil {
 		return err
 	}
 	history.SortControllerRevisions(revisions)
+	glog.Infof("Foo revisions: %v", revisions)
 
 	// get the current, and update revisions
 	currentRevision, updateRevision, collisionCount, err := c.getRevisions(foo, revisions)
@@ -284,7 +281,7 @@ func (c *Controller) syncHandler(key string) error {
 	status.UpdateRevision = updateRevision.Name
 	status.CollisionCount = &collisionCount
 
-	glog.Info("Foo status %v", status)
+	glog.Infof("Foo status %v", status)
 
 	// update the set's status
 	err = c.updateFooStatus(foo, status)
@@ -362,16 +359,17 @@ func computeHash(foo *samplev1alpha1.Foo, collisionCount *int32) uint32 {
 // The Revision of the returned ControllerRevision is set to revision. If the returned error is nil, the returned
 // ControllerRevision is valid.
 func newRevision(foo *samplev1alpha1.Foo, revision int64, collisionCount *int32) (*appsv1.ControllerRevision, error) {
+	glog.Info("Creating patch...")
 	patch, err := getPatch(foo)
 	if err != nil {
 		return nil, err
 	}
-	if err != nil {
-		return nil, err
-	}
 
+	glog.Infof("patch %v", patch)
 	hash := fmt.Sprint(computeHash(foo, collisionCount))
+	glog.Infof("hash %v", hash)
 	name := foo.Name + "-" + rand.SafeEncodeString(hash)
+	glog.Infof("name %v", name)
 	cr := &appsv1.ControllerRevision{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -383,10 +381,11 @@ func newRevision(foo *samplev1alpha1.Foo, revision int64, collisionCount *int32)
 		Data:     runtime.RawExtension{Raw: patch},
 		Revision: revision,
 	}
+	glog.Infof("created CR %v", cr)
 	return cr, nil
 }
 
-var patchCodec = scheme.Codecs.LegacyCodec(appsv1.SchemeGroupVersion)
+var patchCodec = scheme.Codecs.LegacyCodec(controllerKind.GroupVersion())
 
 // getPatch returns a strategic merge patch that can be applied to restore Foo to a
 // previous version.
@@ -440,7 +439,7 @@ func completeRollingUpdate(foo *samplev1alpha1.Foo, status *samplev1alpha1.FooSt
 }
 
 func (c *Controller) ListRevisions(foo *samplev1alpha1.Foo) ([]*appsv1.ControllerRevision, error) {
-	return c.controllerHistory.ListControllerRevisions(foo, nil)
+	return c.controllerHistory.ListControllerRevisions(foo, labels.Everything())
 }
 
 func (c *Controller) AdoptOrphanRevisions(
@@ -500,6 +499,8 @@ func (c *Controller) getRevisions(
 	if err != nil {
 		return nil, nil, collisionCount, err
 	}
+
+	glog.Info("Get new revision: %v", updateRevision)
 
 	// find any equivalent revisions
 	equalRevisions := history.FindEqualRevisions(revisions, updateRevision)
